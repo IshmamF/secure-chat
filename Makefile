@@ -10,8 +10,8 @@ CC       := gcc
 CXX      := g++
 LD       := $(CC)
 LDFLAGS  := $(LDFLAGS) # -L/path/to/libs/
-LDADD    := -lpthread -lcrypto -lgmp $(shell pkg-config --libs gtk+-3.0)
-INCLUDE  := $(shell pkg-config --cflags gtk+-3.0)
+LDADD    := -lpthread -lcrypto -lgmp $(shell pkg-config --libs gtk+-3.0 openssl gmp)
+INCLUDE  := $(shell pkg-config --cflags gtk+-3.0 openssl gmp)
 DEFS     := # -DLINUX
 
 TARGETS  := chat dh-example

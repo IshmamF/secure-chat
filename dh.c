@@ -8,7 +8,18 @@
 #include <gmp.h>
 #include "dh.h"
 #include <string.h>
-#include <endian.h>
+#ifdef __APPLE__
+  #include <libkern/OSByteOrder.h>
+  /* 32-bit little-endian helpers (used by util.c) */
+  #define htole32(x) OSSwapHostToLittleInt32(x)
+  #define le32toh(x) OSSwapLittleToHostInt32(x)
+  /* 64-bit big-endian helpers (used by dh.c) */
+  #define htobe64(x) OSSwapHostToBigInt64(x)
+  #define be64toh(x) OSSwapBigToHostInt64(x)
+#else
+  #include <endian.h>
+#endif
+
 #include <assert.h>
 #include "util.h"
 

@@ -5,7 +5,15 @@
 #include <stdio.h>
 #include <assert.h>
 #include <inttypes.h>
-#include <endian.h>
+#ifdef __APPLE__
+  #include <libkern/OSByteOrder.h>
+  /* map to the little-endian helpers util.c needs: */
+  #define htole32(x) OSSwapHostToLittleInt32(x)
+  #define le32toh(x) OSSwapLittleToHostInt32(x)
+#else
+  #include <endian.h>
+#endif
+
 #include <string.h>
 
 /* when reading long integers, never read more than this many bytes: */

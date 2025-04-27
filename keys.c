@@ -6,6 +6,8 @@
 #include <fcntl.h>
 #include "util.h"
 #include <openssl/sha.h>
+extern int __gmp_fprintf(FILE *stream, const char *format, ...);
+extern int __gmp_fscanf(FILE *stream, const char *format, ...);
 
 int initKey(dhKey* k)
 {
