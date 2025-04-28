@@ -14,7 +14,7 @@ LDADD    := -lpthread -lcrypto -lgmp $(shell pkg-config --libs gtk+-3.0 openssl 
 INCLUDE  := $(shell pkg-config --cflags gtk+-3.0 openssl gmp)
 DEFS     := # -DLINUX
 
-TARGETS  := chat dh-example
+TARGETS  := chat dh-example gen_key
 
 IMPL := chat.o
 ifdef skel
@@ -33,6 +33,9 @@ debug : all
 # }}}
 
 chat : $(IMPL) dh.o keys.o util.o session.o
+	$(LD) $(LDFLAGS) -o $@ $^ $(LDADD)
+
+gen_key : gen_key.o dh.o keys.o util.o
 	$(LD) $(LDFLAGS) -o $@ $^ $(LDADD)
 
 dh-example : dh-example.o dh.o keys.o util.o
