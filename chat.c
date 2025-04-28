@@ -13,11 +13,13 @@
 #ifndef HOST_NAME_MAX
 #define HOST_NAME_MAX 256
 #endif
-
-
 #ifndef PATH_MAX
 #define PATH_MAX 1024
 #endif
+
+#include "session.h"
+static Session* sess;
+
 
 static GtkTextBuffer* tbuf; /* transcript buffer */
 static GtkTextBuffer* mbuf; /* message buffer */
@@ -159,11 +161,8 @@ static void sendMessage(GtkWidget* w /* <-- msg entry widget */, gpointer /* dat
 	size_t len = g_utf8_strlen(message,-1);
 	/* XXX we should probably do the actual network stuff in a different
 	 * thread and have it call this once the message is actually sent. */
-	ssize_t nbytes;
-	if ((nbytes = send(sockfd,message,len,0)) == -1)
-		error("send failed");
-
-	tsappend(message,NULL,1);
+	session_send(sess, (unsigned char*)message, len);
+	tsappend(message, NULL, 1);
 	free(message);
 	/* clear message text and reset focus */
 	gtk_text_buffer_delete(mbuf,&mstart,&mend);
@@ -231,6 +230,11 @@ int main(int argc, char *argv[])
 	} else {
 		initServerNet(port);
 	}
+	sess = session_create(sockfd,
+						/* You can pass your key‐file paths here later: */ 
+						NULL,
+						NULL);
+
 
 	/* setup GTK... */
 	GtkBuilder* builder;
@@ -276,6 +280,7 @@ int main(int argc, char *argv[])
 	gtk_main();
 
 	shutdownNetwork();
+	session_destroy(sess);
 	return 0;
 }
 
@@ -283,23 +288,19 @@ int main(int argc, char *argv[])
  * main loop for processing: */
 void* recvMsg(void*)
 {
-	size_t maxlen = 512;
-	char msg[maxlen+2]; /* might add \n and \0 */
-	ssize_t nbytes;
-	while (1) {
-		if ((nbytes = recv(sockfd,msg,maxlen,0)) == -1)
-			error("recv failed");
-		if (nbytes == 0) {
-			/* XXX maybe show in a status message that the other
-			 * side has disconnected. */
-			return 0;
-		}
-		char* m = malloc(maxlen+2);
-		memcpy(m,msg,nbytes);
-		if (m[nbytes-1] != '\n')
-			m[nbytes++] = '\n';
-		m[nbytes] = 0;
-		g_main_context_invoke(NULL,shownewmessage,(gpointer)m);
-	}
-	return 0;
+    while (1) {
+        unsigned char* buf = NULL;
+        size_t buflen = 0;
+        if (session_recv(sess, &buf, &buflen) != 0) {
+            // either connection closed or authentication failed
+            break;
+        }
+        // Null-terminate and hand off to GTK
+        buf[buflen] = '\0';
+        g_main_context_invoke(NULL, shownewmessage, buf);
+        // session_recv malloc’d buf, so we must NOT free() here—
+        // shownewmessage will free() it for us.
+    }
+    return NULL;
 }
+
