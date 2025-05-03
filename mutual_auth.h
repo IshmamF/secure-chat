@@ -1,4 +1,3 @@
-// mutual_auth.h
 #ifndef MUTUAL_AUTH_H
 #define MUTUAL_AUTH_H
 
@@ -25,4 +24,4 @@ int mutual_authenticate(const char*            my_privkey_file,
                         int                     sockfd,
                         int                     is_client);
 
-#endif // MUTUAL_AUTH_H
+#endif 

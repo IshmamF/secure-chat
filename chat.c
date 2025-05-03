@@ -1,5 +1,5 @@
 #include <gtk/gtk.h>
-#include <glib/gunicode.h> /* for utf8 strlen */
+#include <glib/gunicode.h> 
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netdb.h>
@@ -24,10 +24,9 @@
   #define htobe64(x) OSSwapHostToBigInt64(x)
   #define be64toh(x) OSSwapBigToHostInt64(x)
 #else
-  #include <endian.h>   // on Linux this defines htobe64/be64toh
+  #include <endian.h>   
 #endif
 
-// Prototypes for mutual-auth helpers
 EVP_PKEY* load_private_key(const char* path);
 EVP_PKEY* load_public_key(const char* path);
 int sign_buffer(EVP_PKEY* priv,
@@ -52,7 +51,7 @@ static int listensock, sockfd;
 static int isclient = 1;
 static unsigned char symm_key[32];
 static const size_t symm_key_len = sizeof(symm_key);
-static uint64_t send_seq = 0;        // monotonically increasing
+static uint64_t send_seq = 0;        
 static uint64_t recv_seq_expected = 0;
 
 
@@ -136,11 +135,9 @@ static void test_sign_verify(EVP_PKEY* priv,
 }
 
 
-/* Perform ephemeral DH, derive symm_key, then mutual-auth handshake */
 static unsigned char *g_my_pub, *g_peer_pub;
 static size_t g_my_pub_len, g_peer_pub_len;
 static void perform_handshake() {
-    // Ephemeral X25519 Diffie-Hellman
     EVP_PKEY *mine = generate_key();
     unsigned char* mpub; size_t mlen;
     get_public(mine, &mpub, &mlen);
@@ -164,7 +161,6 @@ static void perform_handshake() {
     EVP_PKEY_free(mine); EVP_PKEY_free(peer);
     fprintf(stderr, "ephemeral DH done\n");
 
-    // expand our 32-byte symm_key into two 32-byte keys via SHA-512
     unsigned char keymat[64];
     SHA512(symm_key, symm_key_len, keymat);
 
@@ -180,12 +176,9 @@ static void perform_handshake() {
     for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", session_k_mac[i]);
     fprintf(stderr, "\n");
 
-
-        // compute transcript hash using SHA256 (as in your snippet)
     SHA256_CTX sha_ctx;
     unsigned char digest[SHA256_DIGEST_LENGTH];
     SHA256_Init(&sha_ctx);
-    // order by lexicographic of public bytes for consistency
     if (memcmp(g_my_pub, g_peer_pub, g_my_pub_len) < 0) {
         SHA256_Update(&sha_ctx, g_my_pub,     g_my_pub_len);
         SHA256_Update(&sha_ctx, g_peer_pub,   g_peer_pub_len);
@@ -196,27 +189,21 @@ static void perform_handshake() {
     SHA256_Update(&sha_ctx, (unsigned char*)"handshake", 9);
     SHA256_Final(digest, &sha_ctx);
 
-        // debug print the digest
     fprintf(stderr, "[DEBUG] digest: ");
     for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) fprintf(stderr, "%02x", digest[i]);
     fprintf(stderr, "\n");
 
-// load long-term keys for self-test
     EVP_PKEY *my_priv = load_private_key("my_priv.pem");
     EVP_PKEY *peer_long = load_public_key("my_pub.pem");
-    // self-test sign+verify locally before network exchange
     test_sign_verify(my_priv, peer_long, digest, SHA256_DIGEST_LENGTH);
 
-    // mutual signature exchange on digest
     unsigned char *sig = NULL; size_t sig_len = 0;
     if (!sign_buffer(my_priv, digest, SHA256_DIGEST_LENGTH, &sig, &sig_len)) error("sign digest");
 
-    // send our signature
     uint16_t sln = htons((uint16_t)sig_len);
     send(sockfd, &sln, sizeof(sln), MSG_WAITALL);
     send(sockfd, sig, sig_len, MSG_WAITALL);
 
-    // receive peer signature length & signature
     uint16_t prn;
 
     ssize_t got = recv(sockfd, &prn, sizeof(prn), MSG_WAITALL);
@@ -240,17 +227,14 @@ void* recvMsg(void*_) {
     uint64_t seq_net_be;
     uint32_t len_net_be;
     while (1) {
-        // 1) Read sequence number (big endian)
         ssize_t n = recv(sockfd, &seq_net_be, sizeof(seq_net_be), MSG_WAITALL);
         if (n != sizeof(seq_net_be)) break;
         uint64_t seq = be64toh(seq_net_be);
 
-        // 2) Read ciphertext length
         n = recv(sockfd, &len_net_be, sizeof(len_net_be), MSG_WAITALL);
         if (n != sizeof(len_net_be)) break;
         size_t L = ntohl(len_net_be);
 
-        // 3) Replay check
         if (seq < recv_seq_expected) {
             fprintf(stderr, "[DEBUG] replay detected: seq %" PRIu64 " < expected %" PRIu64 "", seq, recv_seq_expected);
             // drain unread bytes (ciphertext + tag)
@@ -265,18 +249,15 @@ void* recvMsg(void*_) {
             continue;
         }
 
-        // 4) Read ciphertext
         unsigned char *ciphertext = malloc(L);
         if (!ciphertext) break;
         n = recv(sockfd, ciphertext, L, MSG_WAITALL);
         if (n != (ssize_t)L) { free(ciphertext); break; }
 
-        // 5) Read HMAC tag
         unsigned char tagbuf[32];
         n = recv(sockfd, tagbuf, sizeof(tagbuf), MSG_WAITALL);
         if (n != (ssize_t)sizeof(tagbuf)) { free(ciphertext); break; }
 
-        // —— DEBUG: dump what we received ——
         fprintf(stderr, "[RAW RECV] seq=%" PRIu64 " len=%zu ct=", seq, L);
         for(size_t i = 0; i < L; i++) fprintf(stderr, "%02x", ciphertext[i]);
         fprintf(stderr, " tag=");
@@ -284,7 +265,6 @@ void* recvMsg(void*_) {
         fprintf(stderr, "\n");
 
 
-        // 6) Verify HMAC
         HMAC_CTX *hctx = HMAC_CTX_new();
         unsigned char tag2[32]; unsigned int tag2_len = 0;
         HMAC_Init_ex(hctx, symm_key, symm_key_len, EVP_sha256(), NULL);
@@ -301,7 +281,6 @@ void* recvMsg(void*_) {
         }
         recv_seq_expected = seq + 1;
 
-        // 7) Decrypt and dispatch to UI
         char* pt = malloc(L+1);
         for (size_t i = 0; i < L; i++) pt[i] = ciphertext[i] ^ symm_key[i % symm_key_len];
         pt[L] = ' ';
@@ -315,37 +294,26 @@ void* recvMsg(void*_) {
 static void tsappend(const char *m, char **tags, int nl) {
     GtkTextIter iter;
     gtk_text_buffer_get_end_iter(tbuf, &iter);
-
-    // insert text as you already do...
     gtk_text_buffer_insert(tbuf, &iter, m, -1);
-    // move the existing mark to the new end
     gtk_text_buffer_move_mark(tbuf, mark, &iter);
-
-    // now scroll
     gtk_text_view_scroll_to_mark(tview, mark, 0.0, TRUE, 0.0, 1.0);
 }
 
 
 static void sendMessage(GtkWidget* w, gpointer) {
-    // 0) Grab the plaintext from the GTK buffer
     char* tag[] = {"self", NULL};
     tsappend("me: ", tag, 0);
     GtkTextIter s, e;
     gtk_text_buffer_get_bounds(mbuf, &s, &e);
     char* msg = gtk_text_buffer_get_text(mbuf, &s, &e, TRUE);
     size_t L = g_utf8_strlen(msg, -1);
-
-    // 1) Encrypt into 'ciphertext' (simple XOR)
     unsigned char* ciphertext = malloc(L);
     for (size_t i = 0; i < L; i++) {
         ciphertext[i] = msg[i] ^ symm_key[i % symm_key_len];
     }
 
-    // 2) Sequence number and length headers
     uint64_t seq_net = htobe64(++send_seq);
     uint32_t len_net = htonl((uint32_t)L);
-
-    // 3) Compute HMAC over (seq||len||ciphertext)
     HMAC_CTX* hctx = HMAC_CTX_new();
     unsigned char tagbuf[32];
     unsigned int taglen = 0;
@@ -355,22 +323,15 @@ static void sendMessage(GtkWidget* w, gpointer) {
     HMAC_Update(hctx, ciphertext, L);
     HMAC_Final(hctx, tagbuf, &taglen);
     HMAC_CTX_free(hctx);
-
-    // 4) Send headers, ciphertext, then HMAC tag
     send(sockfd, &seq_net,   sizeof(seq_net), 0);
     send(sockfd, &len_net,   sizeof(len_net), 0);
     send(sockfd, ciphertext, L,               0);
     send(sockfd, tagbuf,     taglen,           0);
-
-    // —— DEBUG: dump raw frame to stderr ——
     fprintf(stderr, "[RAW SEND] seq=%" PRIu64 " len=%u ct=", send_seq, (uint32_t)L);
     for(size_t i = 0; i < L; i++) fprintf(stderr, "%02x", ciphertext[i]);
     fprintf(stderr, " tag=");
     for(unsigned int i = 0; i < taglen; i++) fprintf(stderr, "%02x", tagbuf[i]);
     fprintf(stderr, "\n");
-
-
-    // 5) Update UI & clean up
     tsappend(msg, NULL, 1);
     gtk_text_buffer_delete(mbuf, &s, &e);
     free(msg);
