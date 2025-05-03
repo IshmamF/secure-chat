@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include "dh.h"
 #include "keys.h"
+#include "mutual_auth.h"
 #include <limits.h>
 #ifndef HOST_NAME_MAX
 #define HOST_NAME_MAX 256
@@ -16,6 +17,16 @@
 #ifndef PATH_MAX
 #define PATH_MAX 1024
 #endif
+
+// Prototypes for mutual-auth helpers
+EVP_PKEY* load_private_key(const char* path);
+EVP_PKEY* load_public_key(const char* path);
+int sign_buffer(EVP_PKEY* priv,
+                const unsigned char* msg, size_t msglen,
+                unsigned char** sig_out, size_t* siglen_out);
+int verify_buffer(EVP_PKEY* pub,
+                  const unsigned char* msg, size_t msglen,
+                  const unsigned char* sig, size_t siglen);
 
 static gboolean shownewmessage(gpointer msg);
 static GtkTextBuffer* tbuf;
@@ -29,201 +40,250 @@ static int isclient = 1;
 static unsigned char symm_key[32];
 static const size_t symm_key_len = sizeof(symm_key);
 
-
 static void error(const char *msg) {
     perror(msg);
     exit(EXIT_FAILURE);
 }
 
+/* Ephemeral X25519 key ops */
 static EVP_PKEY* generate_key() {
     EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
     EVP_PKEY *pkey = NULL;
-    if (!pctx || EVP_PKEY_keygen_init(pctx) <= 0 || EVP_PKEY_keygen(pctx, &pkey) <= 0) {
+    if (!pctx || EVP_PKEY_keygen_init(pctx) <= 0 || EVP_PKEY_keygen(pctx, &pkey) <= 0)
         error("Key generation failed");
-    }
     EVP_PKEY_CTX_free(pctx);
     return pkey;
 }
-
 static void get_public(EVP_PKEY *pkey, unsigned char **pub, size_t *pub_len) {
-    if (EVP_PKEY_get_raw_public_key(pkey, NULL, pub_len) <= 0)
-        error("Getting pubkey length failed");
+    if (EVP_PKEY_get_raw_public_key(pkey, NULL, pub_len) <= 0) error("publen failed");
     *pub = malloc(*pub_len);
-    if (EVP_PKEY_get_raw_public_key(pkey, *pub, pub_len) <= 0)
-        error("Getting pubkey failed");
+    if (EVP_PKEY_get_raw_public_key(pkey, *pub, pub_len) <= 0) error("get pub failed");
 }
-
 static void derive_shared(EVP_PKEY *local, EVP_PKEY *peer) {
-    EVP_PKEY_CTX *dctx = EVP_PKEY_CTX_new(local, NULL);
-    if (!dctx || EVP_PKEY_derive_init(dctx) <= 0 || EVP_PKEY_derive_set_peer(dctx, peer) <= 0)
-        error("Derive init failed");
-    size_t secret_len;
-    if (EVP_PKEY_derive(dctx, NULL, &secret_len) <= 0)
-        error("Secret length failed");
-    unsigned char *secret = malloc(secret_len);
-    if (EVP_PKEY_derive(dctx, secret, &secret_len) <= 0)
-        error("Secret derivation failed");
-    SHA256(secret, secret_len, symm_key);
-    EVP_PKEY_CTX_free(dctx);
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(local, NULL);
+    if (!ctx || EVP_PKEY_derive_init(ctx) <= 0 || EVP_PKEY_derive_set_peer(ctx, peer) <= 0) error("derive init");
+    size_t slen; EVP_PKEY_derive(ctx, NULL, &slen);
+    unsigned char *secret = malloc(slen);
+    EVP_PKEY_derive(ctx, secret, &slen);
+    SHA256(secret, slen, symm_key);
     free(secret);
+    EVP_PKEY_CTX_free(ctx);
 }
 
 int initServerNet(int port) {
     int reuse = 1;
-    struct sockaddr_in serv_addr;
+    struct sockaddr_in addr;
     listensock = socket(AF_INET, SOCK_STREAM, 0);
     setsockopt(listensock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-    if (listensock < 0) error("ERROR opening socket");
-    bzero(&serv_addr, sizeof(serv_addr));
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_addr.s_addr = INADDR_ANY;
-    serv_addr.sin_port = htons(port);
-    if (bind(listensock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0)
-        error("ERROR on binding");
-    fprintf(stderr, "listening on port %i...\n", port);
-    listen(listensock, 1);
-    socklen_t clilen;
-    struct sockaddr_in cli_addr;
-    sockfd = accept(listensock, (struct sockaddr*)&cli_addr, &clilen);
-    if (sockfd < 0) error("error on accept");
+    if (listensock<0) error("sock");
+    bzero(&addr, sizeof(addr)); addr.sin_family=AF_INET; addr.sin_addr.s_addr=INADDR_ANY; addr.sin_port=htons(port);
+    bind(listensock,(struct sockaddr*)&addr,sizeof(addr));
+    listen(listensock,1);
+    socklen_t cl=sizeof(addr);
+    sockfd=accept(listensock,(struct sockaddr*)&addr,&cl);
     close(listensock);
-    fprintf(stderr, "connection made, performing handshake...\n");
+    fprintf(stderr,"server: handshake...\n");
     return 0;
 }
-
-static int initClientNet(char* hostname, int port) {
-    struct sockaddr_in serv_addr;
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    struct hostent *server;
-    if (sockfd < 0) error("ERROR opening socket");
-    server = gethostbyname(hostname);
-    if (!server) { fprintf(stderr, "ERROR, no such host\n"); exit(0); }
-    bzero(&serv_addr, sizeof(serv_addr));
-    serv_addr.sin_family = AF_INET;
-    memcpy(&serv_addr.sin_addr.s_addr, server->h_addr, server->h_length);
-    serv_addr.sin_port = htons(port);
-    if (connect(sockfd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0)
-        error("ERROR connecting");
-    fprintf(stderr, "connected, performing handshake...\n");
+static int initClientNet(const char* host,int port) {
+    struct sockaddr_in addr; struct hostent*h;
+    sockfd=socket(AF_INET,SOCK_STREAM,0);
+    h=gethostbyname(host); if(!h) error("nhost");
+    bzero(&addr,sizeof(addr)); addr.sin_family=AF_INET;
+    memcpy(&addr.sin_addr.s_addr,h->h_addr,h->h_length);
+    addr.sin_port=htons(port);
+    connect(sockfd,(struct sockaddr*)&addr,sizeof(addr));
+    fprintf(stderr,"client: handshake...\n");
     return 0;
 }
-
 static int shutdownNetwork() {
-    shutdown(sockfd, 2);
-    unsigned char dummy[64]; ssize_t r;
-    do { r = recv(sockfd, dummy, 64, 0); } while (r > 0);
+    shutdown(sockfd,2);
+    unsigned char buf[64]; while(recv(sockfd,buf,64,0)>0);
     close(sockfd);
     return 0;
 }
 
-static void perform_handshake() {
-    EVP_PKEY *local = generate_key();
-    unsigned char *local_pub; size_t local_pub_len;
-    get_public(local, &local_pub, &local_pub_len);
-    unsigned char *peer_pub; size_t peer_pub_len; uint16_t len_net;
-    if (isclient) {
-        len_net = htons(local_pub_len);
-        send(sockfd, &len_net, sizeof(len_net), 0);
-        send(sockfd, local_pub, local_pub_len, 0);
-        recv(sockfd, &len_net, sizeof(len_net), MSG_WAITALL);
-        peer_pub_len = ntohs(len_net);
-        peer_pub = malloc(peer_pub_len);
-        recv(sockfd, peer_pub, peer_pub_len, MSG_WAITALL);
+int test_sign_verify(EVP_PKEY* priv, EVP_PKEY* pub, unsigned char* digest, size_t dlen) {
+    unsigned char *sig = NULL;
+    size_t siglen = 0;
+    if (!sign_buffer(priv, digest, dlen, &sig, &siglen)) {
+        fprintf(stderr, "LOCAL sign failed");
+    } else if (!verify_buffer(pub, digest, dlen, sig, siglen)) {
+        fprintf(stderr, "LOCAL verify failed");
     } else {
-        recv(sockfd, &len_net, sizeof(len_net), MSG_WAITALL);
-        peer_pub_len = ntohs(len_net);
-        peer_pub = malloc(peer_pub_len);
-        recv(sockfd, peer_pub, peer_pub_len, MSG_WAITALL);
-        len_net = htons(local_pub_len);
-        send(sockfd, &len_net, sizeof(len_net), 0);
-        send(sockfd, local_pub, local_pub_len, 0);
+        fprintf(stderr, "LOCAL sign+verify OK");
     }
-    EVP_PKEY *peer = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL, peer_pub, peer_pub_len);
-    derive_shared(local, peer);
-    free(local_pub); free(peer_pub);
-    EVP_PKEY_free(local); EVP_PKEY_free(peer);
-    fprintf(stderr, "handshake complete, secure channel established.\n");
+    free(sig);
 }
 
-void* recvMsg(void* arg) {
-    (void)arg;
-    while (1) {
-        char buf[1024]; ssize_t len = recv(sockfd, buf, sizeof(buf), 0);
-        if (len <= 0) break;
-        char* msg = malloc(len+1);
-        memcpy(msg, buf, len);
-        msg[len] = '\0';
-        g_idle_add(shownewmessage, msg);
+
+/* Perform ephemeral DH, derive symm_key, then mutual-auth handshake */
+static unsigned char *g_my_pub, *g_peer_pub;
+static size_t g_my_pub_len, g_peer_pub_len;
+static void perform_handshake() {
+    // Ephemeral X25519 Diffie-Hellman
+    EVP_PKEY *mine = generate_key();
+    unsigned char* mpub; size_t mlen;
+    get_public(mine, &mpub, &mlen);
+    uint16_t ln;
+    if (isclient) {
+        ln = htons(mlen); send(sockfd, &ln, 2, 0);
+        send(sockfd, mpub, mlen, 0);
+        recv(sockfd, &ln, 2, MSG_WAITALL); g_peer_pub_len = ntohs(ln);
+        g_peer_pub = malloc(g_peer_pub_len);
+        recv(sockfd, g_peer_pub, g_peer_pub_len, MSG_WAITALL);
+    } else {
+        recv(sockfd, &ln, 2, MSG_WAITALL); g_peer_pub_len = ntohs(ln);
+        g_peer_pub = malloc(g_peer_pub_len);
+        recv(sockfd, g_peer_pub, g_peer_pub_len, MSG_WAITALL);
+        ln = htons(mlen); send(sockfd, &ln, 2, 0);
+        send(sockfd, mpub, mlen, 0);
+    }
+    EVP_PKEY *peer = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL, g_peer_pub, g_peer_pub_len);
+    derive_shared(mine, peer);
+    g_my_pub = mpub; g_my_pub_len = mlen;
+    EVP_PKEY_free(mine); EVP_PKEY_free(peer);
+    fprintf(stderr, "ephemeral DH done\n");
+
+    // expand our 32-byte symm_key into two 32-byte keys via SHA-512
+    unsigned char keymat[64];
+    SHA512(symm_key, symm_key_len, keymat);
+
+    unsigned char session_k_enc[32];
+    unsigned char session_k_mac[32];
+    memcpy(session_k_enc, keymat,       32);
+    memcpy(session_k_mac, keymat + 32,  32);
+
+    fprintf(stderr, "Shared AES key: ");
+    for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", session_k_enc[i]);
+    fprintf(stderr, "\n");
+    fprintf(stderr, "Shared HMAC key: ");
+    for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", session_k_mac[i]);
+    fprintf(stderr, "\n");
+
+
+        // compute transcript hash using SHA256 (as in your snippet)
+    SHA256_CTX sha_ctx;
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    SHA256_Init(&sha_ctx);
+    // order by lexicographic of public bytes for consistency
+    if (memcmp(g_my_pub, g_peer_pub, g_my_pub_len) < 0) {
+        SHA256_Update(&sha_ctx, g_my_pub,     g_my_pub_len);
+        SHA256_Update(&sha_ctx, g_peer_pub,   g_peer_pub_len);
+    } else {
+        SHA256_Update(&sha_ctx, g_peer_pub,   g_peer_pub_len);
+        SHA256_Update(&sha_ctx, g_my_pub,     g_my_pub_len);
+    }
+    SHA256_Update(&sha_ctx, (unsigned char*)"handshake", 9);
+    SHA256_Final(digest, &sha_ctx);
+
+        // debug print the digest
+    fprintf(stderr, "[DEBUG] digest: ");
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) fprintf(stderr, "%02x", digest[i]);
+    fprintf(stderr, "");
+
+// load long-term keys for self-test
+    EVP_PKEY *my_priv = load_private_key("my_priv.pem");
+    EVP_PKEY *peer_long = load_public_key("my_pub.pem");
+    // self-test sign+verify locally before network exchange
+    test_sign_verify(my_priv, peer_long, digest, SHA256_DIGEST_LENGTH);
+
+    // mutual signature exchange on digest
+    unsigned char *sig = NULL; size_t sig_len = 0;
+    if (!sign_buffer(my_priv, digest, SHA256_DIGEST_LENGTH, &sig, &sig_len)) error("sign digest");
+
+    // send our signature
+    uint16_t sln = htons((uint16_t)sig_len);
+    send(sockfd, &sln, sizeof(sln), MSG_WAITALL);
+    send(sockfd, sig, sig_len, MSG_WAITALL);
+
+    // receive peer signature length & signature
+    uint16_t prn;
+
+    ssize_t got = recv(sockfd, &prn, sizeof(prn), MSG_WAITALL);
+    size_t peer_sig_len = ntohs(prn);
+    fprintf(stderr,"[DEBUG] recv length field got=%zd expected=%zu\n", got, sizeof(prn));
+    unsigned char *peer_sig = malloc(peer_sig_len);
+    if (!peer_sig) error("malloc peer_sig");
+    got = recv(sockfd, peer_sig, peer_sig_len, MSG_WAITALL);
+    fprintf(stderr,"[DEBUG] recv sig      got=%zd expected=%zu\n", got, peer_sig_len);
+
+    if (!verify_buffer(peer_long, digest, SHA256_DIGEST_LENGTH, peer_sig, peer_sig_len)) error("Signature verification failed");
+    fprintf(stderr, "Signature verified successfully.");
+
+    free(sig);
+    free(peer_sig);
+    EVP_PKEY_free(my_priv);
+    EVP_PKEY_free(peer_long);
+    EVP_PKEY_free(my_priv);
+    EVP_PKEY_free(peer_long);
+}
+
+void* recvMsg(void*_) {
+    while(1) {
+        char buf[1024]; ssize_t l=recv(sockfd,buf,sizeof(buf),0);
+        if(l<=0)break;
+        char* m=malloc(l+1); memcpy(m,buf,l); m[l]='\0';
+        g_idle_add(shownewmessage,m);
     }
     return NULL;
 }
 
-static const char* usage =
-"Usage: %s [OPTIONS]...\n"
-"Secure chat with PFS handshake.\n\n"
-"  -c, --connect HOST   connect to HOST\n"
-"  -l, --listen         listen mode\n"
-"  -p, --port PORT      port (default 1337)\n"
-"  -h, --help           this message\n";
-
-static void tsappend(char* message, char** tagnames, int ensurenewline) {
-    GtkTextIter t0; gtk_text_buffer_get_end_iter(tbuf, &t0);
-    size_t len = g_utf8_strlen(message, -1);
-    if (ensurenewline && message[len-1] != '\n') message[len++]='\n';
-    gtk_text_buffer_insert(tbuf, &t0, message, len);
-    GtkTextIter t1; gtk_text_buffer_get_end_iter(tbuf, &t1);
-    t0 = t1; gtk_text_iter_backward_chars(&t0, len);
-    if (tagnames) for(char** tag=tagnames; *tag; ++tag)
-        gtk_text_buffer_apply_tag_by_name(tbuf, *tag, &t0, &t1);
-    if (!ensurenewline) return;
-    gtk_text_buffer_add_mark(tbuf, mark, &t1);
-    gtk_text_view_scroll_to_mark(tview, mark, 0.0, TRUE, 0.0,0.0);
-    gtk_text_buffer_delete_mark(tbuf, mark);
+static void tsappend(const char*m,char**t,int nl) {
+    GtkTextIter a; gtk_text_buffer_get_end_iter(tbuf,&a);
+    size_t L=g_utf8_strlen(m,-1); char*tmp=NULL;
+    if(nl && m[L-1]!='\n') { tmp=malloc(L+2); memcpy(tmp,m,L); tmp[L]='\n'; tmp[L+1]='\0'; m=tmp; L++; }
+    gtk_text_buffer_insert(tbuf,&a,m,L);
+    if(tmp) free(tmp);
+    gtk_text_buffer_add_mark(tbuf,mark,&a);
+    gtk_text_view_scroll_to_mark(tview,mark,0,TRUE,0,0);
 }
-
-static void sendMessage(GtkWidget* w, gpointer) {
-    char* tags[] = {"self",NULL}; tsappend("me: ",tags,0);
-    GtkTextIter s,e; gtk_text_buffer_get_start_iter(mbuf,&s);
-    gtk_text_buffer_get_end_iter(mbuf,&e);
-    char* message=gtk_text_buffer_get_text(mbuf,&s,&e,TRUE);
-    size_t len=g_utf8_strlen(message,-1);
-    unsigned char* enc=malloc(len);
-    for(size_t i=0;i<len;i++) enc[i]=message[i]^symm_key[i%symm_key_len];
-    if(send(sockfd,enc,len,0)==-1) error("send failed"); free(enc);
-    tsappend(message,NULL,1); free(message);
-    gtk_text_buffer_delete(mbuf,&s,&e); gtk_widget_grab_focus(w);
+static void sendMessage(GtkWidget*w,gpointer){
+    char* tag[]={"self",NULL}; tsappend("me: ",tag,0);
+    GtkTextIter s,e; gtk_text_buffer_get_bounds(mbuf,&s,&e);
+    char* msg=gtk_text_buffer_get_text(mbuf,&s,&e,TRUE);
+    size_t L=g_utf8_strlen(msg,-1);
+    unsigned char*enc=malloc(L);
+    for(size_t i=0;i<L;i++) enc[i]=msg[i]^symm_key[i%symm_key_len];
+    send(sockfd,enc,L,0); free(enc);
+    tsappend(msg,NULL,1); free(msg);
+    gtk_text_buffer_delete(mbuf,&s,&e);
 }
-
 static gboolean shownewmessage(gpointer msg) {
-    char* tags[] = {"friend",NULL}; tsappend("friend: ",tags,0);
-    char* ct=(char*)msg; size_t len=strlen(ct);
-    for(size_t i=0;i<len;i++) ct[i]^=symm_key[i%symm_key_len];
-    tsappend(ct,NULL,1); free(msg); return FALSE;
+    char* tag[]={"friend",NULL}; tsappend("fr: ",tag,0);
+    char* ct=msg; size_t L=strlen(ct);
+    for(size_t i=0;i<L;i++) ct[i]^=symm_key[i%symm_key_len];
+    tsappend(ct,NULL,1); free(ct);
+    return FALSE;
 }
 
-int main(int argc,char*argv[]){
-    if(init("params")!=0){fprintf(stderr,"could not read DH params\n");return 1;}
-    struct option opts[]={{"connect",1,0,'c'},{"listen",0,0,'l'},{"port",1,0,'p'},{"help",0,0,'h'},{0,0,0,0}};
-    int port=1337; char hostname[HOST_NAME_MAX+1]="localhost"; int c,idx;
-    while((c=getopt_long(argc,argv,"c:lp:h",opts,&idx))!=-1){
-        switch(c){case 'c':strncpy(hostname,optarg,HOST_NAME_MAX);break;
-                   case 'l':isclient=0;break;case 'p':port=atoi(optarg);break;
-                   case 'h':printf(usage,argv[0]);return 0;}
+int main(int c,char**v){
+    int port=1337; char host[HOST_NAME_MAX+1]="localhost";
+    static struct option o[]={{"connect",1,0,'c'},{"listen",0,0,'l'},{"port",1,0,'p'},{0,0,0,0}};
+    int idx; char ch;
+    while((ch=getopt_long(c,v,"c:lp:",o,&idx))!=-1){
+        if(ch=='c') strncpy(host,optarg,HOST_NAME_MAX);
+        else if(ch=='l') isclient=0;
+        else if(ch=='p') port=atoi(optarg);
     }
-    if(isclient)initClientNet(hostname,port);else initServerNet(port);
+    if(isclient) initClientNet(host,port);
+    else         initServerNet(port);
+
     perform_handshake();
-    gtk_init(&argc,&argv);
-    GtkBuilder* b=gtk_builder_new();GError*err=NULL;
-    if(!gtk_builder_add_from_file(b,"layout.ui",&err)){g_printerr("Error: %s\n",err->message);return 1;}
+
+    // mutual authentication already done inside perform_handshake()
+    // skip the extra mutual_authenticate() call
+
+    gtk_init(&c,&v);
+    GtkBuilder*b=gtk_builder_new(); GError*err=NULL;
+    gtk_builder_add_from_file(b,"layout.ui",&err);
     mark=gtk_text_mark_new(NULL,TRUE);
     tview=GTK_TEXT_VIEW(gtk_builder_get_object(b,"transcript"));
     mbuf=gtk_text_view_get_buffer(GTK_TEXT_VIEW(gtk_builder_get_object(b,"message")));
     tbuf=gtk_text_view_get_buffer(tview);
     g_signal_connect(gtk_builder_get_object(b,"send"),"clicked",G_CALLBACK(sendMessage),NULL);
-    gtk_widget_grab_focus(GTK_WIDGET(gtk_builder_get_object(b,"message")));
-    GtkCssProvider*css=gtk_css_provider_new();
-    gtk_css_provider_load_from_path(css,"colors.css",NULL);
-    gtk_style_context_add_provider_for_screen(gdk_screen_get_default(),GTK_STYLE_PROVIDER(css),GTK_STYLE_PROVIDER_PRIORITY_USER);
     pthread_create(&trecv,NULL,recvMsg,NULL);
-    gtk_main(); shutdownNetwork(); return 0;
+    gtk_main();
+    shutdownNetwork();
+    return 0;
 }

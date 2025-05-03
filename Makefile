@@ -32,10 +32,10 @@ debug : all
 .PHONY : debug
 # }}}
 
-chat : $(IMPL) dh.o keys.o util.o mutual-auth.o
+chat : $(IMPL) dh.o keys.o util.o mutual_auth.o
 	$(LD) $(LDFLAGS) -o $@ $^ $(LDADD)
 
-dh-example : dh-example.o dh.o keys.o util.o mutual-auth.o
+dh-example : dh-example.o dh.o keys.o util.o
 	$(LD) $(LDFLAGS) -o $@ $^ $(LDADD)
 
 %.o : %.cpp $(HEADERS)
