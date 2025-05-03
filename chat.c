@@ -5,6 +5,7 @@
 #include <netdb.h>
 #include <openssl/evp.h>
 #include <openssl/sha.h>
+#include <openssl/hmac.h>  // for HMAC()
 #include <getopt.h>
 #include <stdint.h>
 #include "dh.h"
@@ -18,6 +19,14 @@
 #define PATH_MAX 1024
 #endif
 
+#ifdef __APPLE__
+  #include <libkern/OSByteOrder.h>
+  #define htobe64(x) OSSwapHostToBigInt64(x)
+  #define be64toh(x) OSSwapBigToHostInt64(x)
+#else
+  #include <endian.h>   // on Linux this defines htobe64/be64toh
+#endif
+
 // Prototypes for mutual-auth helpers
 EVP_PKEY* load_private_key(const char* path);
 EVP_PKEY* load_public_key(const char* path);
@@ -27,6 +36,10 @@ int sign_buffer(EVP_PKEY* priv,
 int verify_buffer(EVP_PKEY* pub,
                   const unsigned char* msg, size_t msglen,
                   const unsigned char* sig, size_t siglen);
+static void test_sign_verify(EVP_PKEY* priv,
+                             EVP_PKEY* pub,
+                             unsigned char* digest,
+                             size_t dlen);
 
 static gboolean shownewmessage(gpointer msg);
 static GtkTextBuffer* tbuf;
@@ -39,6 +52,9 @@ static int listensock, sockfd;
 static int isclient = 1;
 static unsigned char symm_key[32];
 static const size_t symm_key_len = sizeof(symm_key);
+static uint64_t send_seq = 0;        // monotonically increasing
+static uint64_t recv_seq_expected = 0;
+
 
 static void error(const char *msg) {
     perror(msg);
@@ -103,7 +119,10 @@ static int shutdownNetwork() {
     return 0;
 }
 
-int test_sign_verify(EVP_PKEY* priv, EVP_PKEY* pub, unsigned char* digest, size_t dlen) {
+static void test_sign_verify(EVP_PKEY* priv,
+                             EVP_PKEY* pub,
+                             unsigned char* digest,
+                             size_t dlen) {
     unsigned char *sig = NULL;
     size_t siglen = 0;
     if (!sign_buffer(priv, digest, dlen, &sig, &siglen)) {
@@ -180,7 +199,7 @@ static void perform_handshake() {
         // debug print the digest
     fprintf(stderr, "[DEBUG] digest: ");
     for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) fprintf(stderr, "%02x", digest[i]);
-    fprintf(stderr, "");
+    fprintf(stderr, "\n");
 
 // load long-term keys for self-test
     EVP_PKEY *my_priv = load_private_key("my_priv.pem");
@@ -215,45 +234,155 @@ static void perform_handshake() {
     free(peer_sig);
     EVP_PKEY_free(my_priv);
     EVP_PKEY_free(peer_long);
-    EVP_PKEY_free(my_priv);
-    EVP_PKEY_free(peer_long);
 }
 
 void* recvMsg(void*_) {
-    while(1) {
-        char buf[1024]; ssize_t l=recv(sockfd,buf,sizeof(buf),0);
-        if(l<=0)break;
-        char* m=malloc(l+1); memcpy(m,buf,l); m[l]='\0';
-        g_idle_add(shownewmessage,m);
+    uint64_t seq_net_be;
+    uint32_t len_net_be;
+    while (1) {
+        // 1) Read sequence number (big endian)
+        ssize_t n = recv(sockfd, &seq_net_be, sizeof(seq_net_be), MSG_WAITALL);
+        if (n != sizeof(seq_net_be)) break;
+        uint64_t seq = be64toh(seq_net_be);
+
+        // 2) Read ciphertext length
+        n = recv(sockfd, &len_net_be, sizeof(len_net_be), MSG_WAITALL);
+        if (n != sizeof(len_net_be)) break;
+        size_t L = ntohl(len_net_be);
+
+        // 3) Replay check
+        if (seq < recv_seq_expected) {
+            fprintf(stderr, "[DEBUG] replay detected: seq %" PRIu64 " < expected %" PRIu64 "", seq, recv_seq_expected);
+            // drain unread bytes (ciphertext + tag)
+            size_t toskip = L + 32;
+            unsigned char tmp[1024];
+            while (toskip > 0) {
+                size_t chunk = toskip < sizeof(tmp) ? toskip : sizeof(tmp);
+                n = recv(sockfd, tmp, chunk, MSG_WAITALL);
+                if (n <= 0) break;
+                toskip -= n;
+            }
+            continue;
+        }
+
+        // 4) Read ciphertext
+        unsigned char *ciphertext = malloc(L);
+        if (!ciphertext) break;
+        n = recv(sockfd, ciphertext, L, MSG_WAITALL);
+        if (n != (ssize_t)L) { free(ciphertext); break; }
+
+        // 5) Read HMAC tag
+        unsigned char tagbuf[32];
+        n = recv(sockfd, tagbuf, sizeof(tagbuf), MSG_WAITALL);
+        if (n != (ssize_t)sizeof(tagbuf)) { free(ciphertext); break; }
+
+        // —— DEBUG: dump what we received ——
+        fprintf(stderr, "[RAW RECV] seq=%" PRIu64 " len=%zu ct=", seq, L);
+        for(size_t i = 0; i < L; i++) fprintf(stderr, "%02x", ciphertext[i]);
+        fprintf(stderr, " tag=");
+        for(size_t i = 0; i < sizeof(tagbuf); i++) fprintf(stderr, "%02x", tagbuf[i]);
+        fprintf(stderr, "\n");
+
+
+        // 6) Verify HMAC
+        HMAC_CTX *hctx = HMAC_CTX_new();
+        unsigned char tag2[32]; unsigned int tag2_len = 0;
+        HMAC_Init_ex(hctx, symm_key, symm_key_len, EVP_sha256(), NULL);
+        HMAC_Update(hctx, (unsigned char*)&seq_net_be, sizeof(seq_net_be));
+        HMAC_Update(hctx, (unsigned char*)&len_net_be, sizeof(len_net_be));
+        HMAC_Update(hctx, ciphertext, L);
+        HMAC_Final(hctx, tag2, &tag2_len);
+        HMAC_CTX_free(hctx);
+
+        if (CRYPTO_memcmp(tagbuf, tag2, tag2_len) != 0) {
+            fprintf(stderr, "[DEBUG] HMAC verification failed for seq %" PRIu64 "", seq);
+            free(ciphertext);
+            continue;
+        }
+        recv_seq_expected = seq + 1;
+
+        // 7) Decrypt and dispatch to UI
+        char* pt = malloc(L+1);
+        for (size_t i = 0; i < L; i++) pt[i] = ciphertext[i] ^ symm_key[i % symm_key_len];
+        pt[L] = ' ';
+        g_idle_add(shownewmessage, pt);
+        free(ciphertext);
     }
     return NULL;
 }
 
-static void tsappend(const char*m,char**t,int nl) {
-    GtkTextIter a; gtk_text_buffer_get_end_iter(tbuf,&a);
-    size_t L=g_utf8_strlen(m,-1); char*tmp=NULL;
-    if(nl && m[L-1]!='\n') { tmp=malloc(L+2); memcpy(tmp,m,L); tmp[L]='\n'; tmp[L+1]='\0'; m=tmp; L++; }
-    gtk_text_buffer_insert(tbuf,&a,m,L);
-    if(tmp) free(tmp);
-    gtk_text_buffer_add_mark(tbuf,mark,&a);
-    gtk_text_view_scroll_to_mark(tview,mark,0,TRUE,0,0);
+
+static void tsappend(const char *m, char **tags, int nl) {
+    GtkTextIter iter;
+    gtk_text_buffer_get_end_iter(tbuf, &iter);
+
+    // insert text as you already do...
+    gtk_text_buffer_insert(tbuf, &iter, m, -1);
+    // move the existing mark to the new end
+    gtk_text_buffer_move_mark(tbuf, mark, &iter);
+
+    // now scroll
+    gtk_text_view_scroll_to_mark(tview, mark, 0.0, TRUE, 0.0, 1.0);
 }
-static void sendMessage(GtkWidget*w,gpointer){
-    char* tag[]={"self",NULL}; tsappend("me: ",tag,0);
-    GtkTextIter s,e; gtk_text_buffer_get_bounds(mbuf,&s,&e);
-    char* msg=gtk_text_buffer_get_text(mbuf,&s,&e,TRUE);
-    size_t L=g_utf8_strlen(msg,-1);
-    unsigned char*enc=malloc(L);
-    for(size_t i=0;i<L;i++) enc[i]=msg[i]^symm_key[i%symm_key_len];
-    send(sockfd,enc,L,0); free(enc);
-    tsappend(msg,NULL,1); free(msg);
-    gtk_text_buffer_delete(mbuf,&s,&e);
+
+
+static void sendMessage(GtkWidget* w, gpointer) {
+    // 0) Grab the plaintext from the GTK buffer
+    char* tag[] = {"self", NULL};
+    tsappend("me: ", tag, 0);
+    GtkTextIter s, e;
+    gtk_text_buffer_get_bounds(mbuf, &s, &e);
+    char* msg = gtk_text_buffer_get_text(mbuf, &s, &e, TRUE);
+    size_t L = g_utf8_strlen(msg, -1);
+
+    // 1) Encrypt into 'ciphertext' (simple XOR)
+    unsigned char* ciphertext = malloc(L);
+    for (size_t i = 0; i < L; i++) {
+        ciphertext[i] = msg[i] ^ symm_key[i % symm_key_len];
+    }
+
+    // 2) Sequence number and length headers
+    uint64_t seq_net = htobe64(++send_seq);
+    uint32_t len_net = htonl((uint32_t)L);
+
+    // 3) Compute HMAC over (seq||len||ciphertext)
+    HMAC_CTX* hctx = HMAC_CTX_new();
+    unsigned char tagbuf[32];
+    unsigned int taglen = 0;
+    HMAC_Init_ex(hctx, symm_key, symm_key_len, EVP_sha256(), NULL);
+    HMAC_Update(hctx, (unsigned char*)&seq_net, sizeof(seq_net));
+    HMAC_Update(hctx, (unsigned char*)&len_net, sizeof(len_net));
+    HMAC_Update(hctx, ciphertext, L);
+    HMAC_Final(hctx, tagbuf, &taglen);
+    HMAC_CTX_free(hctx);
+
+    // 4) Send headers, ciphertext, then HMAC tag
+    send(sockfd, &seq_net,   sizeof(seq_net), 0);
+    send(sockfd, &len_net,   sizeof(len_net), 0);
+    send(sockfd, ciphertext, L,               0);
+    send(sockfd, tagbuf,     taglen,           0);
+
+    // —— DEBUG: dump raw frame to stderr ——
+    fprintf(stderr, "[RAW SEND] seq=%" PRIu64 " len=%u ct=", send_seq, (uint32_t)L);
+    for(size_t i = 0; i < L; i++) fprintf(stderr, "%02x", ciphertext[i]);
+    fprintf(stderr, " tag=");
+    for(unsigned int i = 0; i < taglen; i++) fprintf(stderr, "%02x", tagbuf[i]);
+    fprintf(stderr, "\n");
+
+
+    // 5) Update UI & clean up
+    tsappend(msg, NULL, 1);
+    gtk_text_buffer_delete(mbuf, &s, &e);
+    free(msg);
+    free(ciphertext);
 }
+
+
 static gboolean shownewmessage(gpointer msg) {
-    char* tag[]={"friend",NULL}; tsappend("fr: ",tag,0);
-    char* ct=msg; size_t L=strlen(ct);
-    for(size_t i=0;i<L;i++) ct[i]^=symm_key[i%symm_key_len];
-    tsappend(ct,NULL,1); free(ct);
+    char* plaintext = msg;
+    tsappend( "friend: ", NULL, 0 );  // no tag colors, or define tags
+    tsappend(plaintext,    NULL, 1);
+    free(plaintext);
     return FALSE;
 }
 
@@ -277,10 +406,30 @@ int main(int c,char**v){
     gtk_init(&c,&v);
     GtkBuilder*b=gtk_builder_new(); GError*err=NULL;
     gtk_builder_add_from_file(b,"layout.ui",&err);
-    mark=gtk_text_mark_new(NULL,TRUE);
+    if (err) {
+        g_printerr("Error loading layout.ui: %s\n", err->message);
+        g_error_free(err);
+        exit(1);
+    }
+
     tview=GTK_TEXT_VIEW(gtk_builder_get_object(b,"transcript"));
+    if (!GTK_IS_TEXT_VIEW(tview)) {
+        g_printerr("Couldn't find TextView 'transcript' in layout.ui\n");
+        exit(1);
+    }
     mbuf=gtk_text_view_get_buffer(GTK_TEXT_VIEW(gtk_builder_get_object(b,"message")));
     tbuf=gtk_text_view_get_buffer(tview);
+    if (!GTK_IS_TEXT_BUFFER(tbuf)) {
+        g_printerr("Couldn't get buffer from TextView\n");
+        exit(1);
+    }
+
+    mark = gtk_text_buffer_create_mark(tbuf, "end", NULL, TRUE);
+    if (!GTK_IS_TEXT_MARK(mark)) {
+        g_printerr("Failed to create mark\n");
+        exit(1);
+    }
+
     g_signal_connect(gtk_builder_get_object(b,"send"),"clicked",G_CALLBACK(sendMessage),NULL);
     pthread_create(&trecv,NULL,recvMsg,NULL);
     gtk_main();
