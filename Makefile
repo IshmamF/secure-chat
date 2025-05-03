@@ -32,10 +32,7 @@ debug : all
 .PHONY : debug
 # }}}
 
-chat : $(IMPL) dh.o keys.o util.o session.o
-	$(LD) $(LDFLAGS) -o $@ $^ $(LDADD)
-
-gen_key : gen_key.o dh.o keys.o util.o
+chat : $(IMPL) dh.o keys.o util.o mutual_auth.o
 	$(LD) $(LDFLAGS) -o $@ $^ $(LDADD)
 
 dh-example : dh-example.o dh.o keys.o util.o

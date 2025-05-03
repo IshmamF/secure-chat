@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <assert.h>
 #include <inttypes.h>
+
 #ifdef __APPLE__
   #include <libkern/OSByteOrder.h>
   /* map to the little-endian helpers util.c needs: */
