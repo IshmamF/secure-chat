@@ -9,12 +9,21 @@ int main(int argc, char **argv) {
         return 1;
     }
     const char *fname = argv[1];
+
+    // ←—— load the same "params" file chat.c uses
+    if (init("params") != 0) {
+        fprintf(stderr, "could not read DH params\n");
+        return 1;
+    }
+
     dhKey k;
     initKey(&k);
-    // generate a fresh keypair
+
+    // generate a fresh static keypair
     dhGen(k.SK, k.PK);
-    // write both private and public
-    if (writeDH(fname, &k) != 0) {
+
+    // write private (fname) and public (fname.pub)
+    if (writeDH((char*)fname, &k) != 0) {
         fprintf(stderr, "Error writing key %s\n", fname);
         return 1;
     }
