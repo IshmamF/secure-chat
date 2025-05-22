@@ -292,15 +292,37 @@ void* recvMsg(void*_) {
 }
 
 
-static void tsappend(const char *m, char **tags, int nl) {
-    GtkTextIter iter;
-    gtk_text_buffer_get_end_iter(tbuf, &iter);
-    gtk_text_buffer_insert(tbuf, &iter, m, -1);
-    if (nl) {
-        gtk_text_buffer_insert(tbuf, &iter, "\n", -1);
+static void tsappend(const char *message, char **tagnames, int ensurenewline)
+{
+    GtkTextIter start, end;
+    gtk_text_buffer_get_end_iter(tbuf, &end);
+
+    g_autofree char *buf = g_strdup(message);
+    size_t len = g_utf8_strlen(buf, -1);
+
+    if (ensurenewline && len > 0 && buf[len-1] != '\n') {
+        buf = g_realloc(buf, len + 2);
+        buf[len++] = '\n';
+        buf[len]   = '\0';
     }
-    gtk_text_buffer_move_mark(tbuf, mark, &iter);
-    gtk_text_view_scroll_to_mark(tview, mark, 0.0, TRUE, 0.0, 1.0);
+
+    gtk_text_buffer_insert(tbuf, &end, buf, len);
+
+    start = end;
+    gtk_text_iter_backward_chars(&start, len);
+
+    if (tagnames) {
+        for (char **tag = tagnames; *tag; ++tag) {
+            gtk_text_buffer_apply_tag_by_name(tbuf, *tag, &start, &end);
+        }
+    }
+
+    if (!ensurenewline)
+        return;
+
+    gtk_text_buffer_add_mark(tbuf, mark, &end);
+    gtk_text_view_scroll_to_mark(tview, mark, 0.0, FALSE, 0.0, 1.0);
+    gtk_text_buffer_delete_mark(tbuf, mark);
 }
 
 
