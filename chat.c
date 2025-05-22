@@ -7,6 +7,8 @@
 #include <openssl/evp.h>
 #include <openssl/sha.h>
 #include <openssl/hmac.h>  // for HMAC()
+#include <openssl/rand.h>     
+#include <openssl/crypto.h>    
 #include <getopt.h>
 #include <stdint.h>
 #include "dh.h"
@@ -51,6 +53,8 @@ void* recvMsg(void*);
 static int listensock, sockfd;
 static int isclient = 1;
 static unsigned char symm_key[32];
+unsigned char session_k_enc[32];
+unsigned char session_k_mac[32];
 static const size_t symm_key_len = sizeof(symm_key);
 static uint64_t send_seq = 0;        
 static uint64_t recv_seq_expected = 0;
@@ -165,10 +169,9 @@ static void perform_handshake() {
     unsigned char keymat[64];
     SHA512(symm_key, symm_key_len, keymat);
 
-    unsigned char session_k_enc[32];
-    unsigned char session_k_mac[32];
-    memcpy(session_k_enc, keymat,       32);
-    memcpy(session_k_mac, keymat + 32,  32);
+    memcpy(session_k_enc, keymat, 32);
+    memcpy(session_k_mac, keymat + 32, 32);
+
 
     fprintf(stderr, "Shared AES key: ");
     for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", session_k_enc[i]);
@@ -234,12 +237,10 @@ void* recvMsg(void*_) {
 
         n = recv(sockfd, &len_net_be, sizeof(len_net_be), MSG_WAITALL);
         if (n != sizeof(len_net_be)) break;
-        size_t L = ntohl(len_net_be);
+        uint32_t payload_len = ntohl(len_net_be);
 
         if (seq < recv_seq_expected) {
-            fprintf(stderr, "[DEBUG] replay detected: seq %" PRIu64 " < expected %" PRIu64 "", seq, recv_seq_expected);
-            // drain unread bytes (ciphertext + tag)
-            size_t toskip = L + 32;
+            size_t toskip = payload_len;
             unsigned char tmp[1024];
             while (toskip > 0) {
                 size_t chunk = toskip < sizeof(tmp) ? toskip : sizeof(tmp);
@@ -250,46 +251,53 @@ void* recvMsg(void*_) {
             continue;
         }
 
-        unsigned char *ciphertext = malloc(L);
-        if (!ciphertext) break;
-        n = recv(sockfd, ciphertext, L, MSG_WAITALL);
-        if (n != (ssize_t)L) { free(ciphertext); break; }
+        unsigned char iv[16];
+        n = recv(sockfd, iv, sizeof(iv), MSG_WAITALL);
+        if (n != sizeof(iv)) break;
+        payload_len -= sizeof(iv);
 
-        unsigned char tagbuf[32];
-        n = recv(sockfd, tagbuf, sizeof(tagbuf), MSG_WAITALL);
-        if (n != (ssize_t)sizeof(tagbuf)) { free(ciphertext); break; }
+        size_t tag_len = 32;
+        size_t ct_len  = payload_len - tag_len;
+        unsigned char* ciphertext = malloc(ct_len);
+        n = recv(sockfd, ciphertext, ct_len, MSG_WAITALL);
+        if (n != (ssize_t)ct_len) { free(ciphertext); break; }
 
-        fprintf(stderr, "[RAW RECV] seq=%" PRIu64 " len=%zu ct=", seq, L);
-        for(size_t i = 0; i < L; i++) fprintf(stderr, "%02x", ciphertext[i]);
-        fprintf(stderr, " tag=");
-        for(size_t i = 0; i < sizeof(tagbuf); i++) fprintf(stderr, "%02x", tagbuf[i]);
-        fprintf(stderr, "\n");
+        unsigned char recv_tag[32];
+        n = recv(sockfd, recv_tag, tag_len, MSG_WAITALL);
+        if (n != (ssize_t)tag_len) { free(ciphertext); break; }
 
-
-        HMAC_CTX *hctx = HMAC_CTX_new();
-        unsigned char tag2[32]; unsigned int tag2_len = 0;
-        HMAC_Init_ex(hctx, symm_key, symm_key_len, EVP_sha256(), NULL);
-        HMAC_Update(hctx, (unsigned char*)&seq_net_be, sizeof(seq_net_be));
-        HMAC_Update(hctx, (unsigned char*)&len_net_be, sizeof(len_net_be));
-        HMAC_Update(hctx, ciphertext, L);
-        HMAC_Final(hctx, tag2, &tag2_len);
+        HMAC_CTX* hctx = HMAC_CTX_new();
+        unsigned char calc_tag[32];
+        unsigned int calc_len = 0;
+        HMAC_Init_ex(hctx, session_k_mac, 32, EVP_sha256(), NULL);
+        HMAC_Update(hctx, iv, sizeof(iv));
+        HMAC_Update(hctx, ciphertext, ct_len);
+        HMAC_Final(hctx, calc_tag, &calc_len);
         HMAC_CTX_free(hctx);
 
-        if (CRYPTO_memcmp(tagbuf, tag2, tag2_len) != 0) {
-            fprintf(stderr, "[DEBUG] HMAC verification failed for seq %" PRIu64 "", seq);
+        if (calc_len != tag_len || CRYPTO_memcmp(calc_tag, recv_tag, tag_len) != 0) {
             free(ciphertext);
             continue;
         }
         recv_seq_expected = seq + 1;
 
-        char* pt = malloc(L+1);
-        for (size_t i = 0; i < L; i++) pt[i] = ciphertext[i] ^ symm_key[i % symm_key_len];
-        pt[L] = ' ';
-        g_idle_add(shownewmessage, pt);
+        EVP_CIPHER_CTX* dctx = EVP_CIPHER_CTX_new();
+        unsigned char* plaintext = malloc(ct_len);
+        int len = 0, plain_len = 0;
+        EVP_DecryptInit_ex(dctx, EVP_aes_256_cbc(), NULL, session_k_enc, iv);
+        EVP_DecryptUpdate(dctx, plaintext, &len, ciphertext, ct_len);
+        plain_len = len;
+        EVP_DecryptFinal_ex(dctx, plaintext + len, &len);
+        plain_len += len;
+        EVP_CIPHER_CTX_free(dctx);
+
+        plaintext[plain_len] = '\0';
+        g_idle_add(shownewmessage, plaintext);
         free(ciphertext);
     }
     return NULL;
 }
+
 
 
 static void tsappend(const char *message, char **tagnames, int ensurenewline)
@@ -333,30 +341,38 @@ static void sendMessage(GtkWidget* w, gpointer) {
     gtk_text_buffer_get_bounds(mbuf, &s, &e);
     char* msg = gtk_text_buffer_get_text(mbuf, &s, &e, TRUE);
     size_t L = g_utf8_strlen(msg, -1);
-    unsigned char* ciphertext = malloc(L);
-    for (size_t i = 0; i < L; i++) {
-        ciphertext[i] = msg[i] ^ symm_key[i % symm_key_len];
-    }
-
-    uint64_t seq_net = htobe64(++send_seq);
-    uint32_t len_net = htonl((uint32_t)L);
+    unsigned char iv[16];
+    RAND_bytes(iv, sizeof(iv));
+    int block_size = EVP_CIPHER_block_size(EVP_aes_256_cbc());
+    int max_ct = L + block_size;
+    unsigned char* ciphertext = malloc(max_ct);
+    int len = 0, ciphertext_len = 0;
+    EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
+    EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, session_k_enc, iv);
+    EVP_EncryptUpdate(ctx, ciphertext, &len, (unsigned char*)msg, (int)L);
+    ciphertext_len = len;
+    EVP_EncryptFinal_ex(ctx, ciphertext + len, &len);
+    ciphertext_len += len;
+    EVP_CIPHER_CTX_free(ctx);
     HMAC_CTX* hctx = HMAC_CTX_new();
     unsigned char tagbuf[32];
     unsigned int taglen = 0;
-    HMAC_Init_ex(hctx, symm_key, symm_key_len, EVP_sha256(), NULL);
-    HMAC_Update(hctx, (unsigned char*)&seq_net, sizeof(seq_net));
-    HMAC_Update(hctx, (unsigned char*)&len_net, sizeof(len_net));
-    HMAC_Update(hctx, ciphertext, L);
+    HMAC_Init_ex(hctx, session_k_mac, 32, EVP_sha256(), NULL);
+    HMAC_Update(hctx, iv, sizeof(iv));
+    HMAC_Update(hctx, ciphertext, ciphertext_len);
     HMAC_Final(hctx, tagbuf, &taglen);
     HMAC_CTX_free(hctx);
-    send(sockfd, &seq_net,   sizeof(seq_net), 0);
-    send(sockfd, &len_net,   sizeof(len_net), 0);
-    send(sockfd, ciphertext, L,               0);
-    send(sockfd, tagbuf,     taglen,           0);
-    fprintf(stderr, "[RAW SEND] seq=%" PRIu64 " len=%u ct=", send_seq, (uint32_t)L);
-    for(size_t i = 0; i < L; i++) fprintf(stderr, "%02x", ciphertext[i]);
+    uint64_t seq_net = htobe64(++send_seq);
+    uint32_t len_net = htonl((uint32_t)(sizeof(iv) + ciphertext_len + taglen));
+    send(sockfd, &seq_net,   sizeof(seq_net),   0);
+    send(sockfd, &len_net,   sizeof(len_net),   0);
+    send(sockfd, iv,         sizeof(iv),        0);
+    send(sockfd, ciphertext, ciphertext_len,    0);
+    send(sockfd, tagbuf,     taglen,            0);
+    fprintf(stderr, "[RAW SEND] seq=%" PRIu64 " len=%u ct=", send_seq, ntohl(len_net) - sizeof(iv) - taglen);
+    for (int i = 0; i < ciphertext_len; i++) fprintf(stderr, "%02x", ciphertext[i]);
     fprintf(stderr, " tag=");
-    for(unsigned int i = 0; i < taglen; i++) fprintf(stderr, "%02x", tagbuf[i]);
+    for (unsigned int i = 0; i < taglen; i++) fprintf(stderr, "%02x", tagbuf[i]);
     fprintf(stderr, "\n");
     tsappend(msg, NULL, 1);
     gtk_text_buffer_delete(mbuf, &s, &e);
