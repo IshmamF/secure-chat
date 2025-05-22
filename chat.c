@@ -296,6 +296,9 @@ static void tsappend(const char *m, char **tags, int nl) {
     GtkTextIter iter;
     gtk_text_buffer_get_end_iter(tbuf, &iter);
     gtk_text_buffer_insert(tbuf, &iter, m, -1);
+    if (nl) {
+        gtk_text_buffer_insert(tbuf, &iter, "\n", -1);
+    }
     gtk_text_buffer_move_mark(tbuf, mark, &iter);
     gtk_text_view_scroll_to_mark(tview, mark, 0.0, TRUE, 0.0, 1.0);
 }
@@ -386,11 +389,14 @@ int main(int c,char**v){
         exit(1);
     }
 
-    mark = gtk_text_buffer_create_mark(tbuf, "end", NULL, TRUE);
+    GtkTextIter iter;
+    gtk_text_buffer_get_end_iter(tbuf, &iter);
+    mark = gtk_text_buffer_create_mark(tbuf, "end", &iter, TRUE);
     if (!GTK_IS_TEXT_MARK(mark)) {
         g_printerr("Failed to create mark\n");
         exit(1);
     }
+
 
     g_signal_connect(gtk_builder_get_object(b,"send"),"clicked",G_CALLBACK(sendMessage),NULL);
     pthread_create(&trecv,NULL,recvMsg,NULL);
